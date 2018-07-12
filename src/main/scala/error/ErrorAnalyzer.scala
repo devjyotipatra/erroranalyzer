@@ -13,6 +13,7 @@ import scala.reflect.ClassTag
 import scala.collection.mutable.WrappedArray
 import scala.collection.immutable.HashMap
 import scala.collection.mutable.ListBuffer
+import scala.math.log
 
 
 import org.apache.spark.sql.Row
@@ -27,6 +28,13 @@ object ErrorAnalysis {
    case class Error(engine: String, message: Message)
 
    case class Message(status_code: Long, state: String, msg: String)
+
+   case class ErrorToken(engine: String, status_code: Long, state: String,
+                        exception: String, tokens: List[String],
+                        termFrequencies: scala.collection.mutable.HashMap[String, Int])
+
+   case class ErrorMessage(engine: String, status_code: Long, state: String,
+                        exeception: String, msg: String)
 
    val ordinary = (('a' to 'z') ++ ('A' to 'Z') ++ Seq('.')).toSet
 
@@ -63,10 +71,9 @@ object ErrorAnalysis {
 
         val err_df = df
 
-        implicit def encoder[Error](implicit ct: ClassTag[Error]) =
+        implicit def encodeError[Error](implicit ct: ClassTag[Error]) =
             org.apache.spark.sql.Encoders.kryo[Error](ct)
 
-        println("############## " + encoder.schema)
 
         val fdf = err_df.map { r => {
                 val engine = r.getAs[String]("EXECUTION_ENGINE")
@@ -97,40 +104,81 @@ object ErrorAnalysis {
                 } else {
                   Error(engine, null)
                 }
-        }} (encoder)
+        }} (encodeError)
+
+
+      //  implicit def encodeErrorTokens[ErrorToken](implicit ct: ClassTag[ErrorToken]) =
+      //      org.apache.spark.sql.Encoders.kryo[ErrorToken](ct)
 
         val ddf = fdf.rdd.map { x => x match {
-          case y: Error => y.message match {
-            case z: Message => {
-              val tokenList: List[String] = tokenize(z.msg.split("[ \n\t]+"))
-              if (!tokenList.isEmpty) {
-                val exeception = tokenList.head
-                val tokens = tokenList.drop(1)
-                val termFrequencies = transform(tokens)
-                termFrequencies
-              } else {
-                null
+          case y: Error =>
+            val engine = y.engine
+
+            y.message match {
+              case z: Message => {
+                val status_code = z.status_code
+                val state = z.state
+                val tokenList: List[String] = tokenize(z.msg.split("[ \n\t]+"))
+
+                if (!tokenList.isEmpty) {
+                  val exception = tokenList.head
+                  val tokens = tokenList.drop(1)
+                  val termFrequencies = transform(tokens)
+
+                  ErrorToken(engine, status_code, state, exception, tokens,
+                              termFrequencies)
+                } else {
+                  null
+                }
               }
-            }
-            case _ => null
+              case _ => null
           }
           case _ => null
         }}
 
-        ddf.collect().foreach(println)
 
-        /*val termDocFreq = scala.collection.mutable.HashMap[String, Int]()
+
+        val termDocFreq = scala.collection.mutable.HashMap[String, Int]()
         val setTF = (s: String) => termDocFreq.getOrElse(s, 0) + 1
-        ddf.collect().foreach({
-          termFrequencies =>
-          if (termFrequencies != null) {
-            termFrequencies.foreach {
-                case(term, freq) => termDocFreq.put(term, setTF(term))
+        ddf.collect().foreach({ token => token match {
+          case e: ErrorToken =>
+            if (e.termFrequencies != null) {
+              e.termFrequencies.foreach {
+                  case(term, freq) => termDocFreq.put(term, setTF(term))
           }}
+          case null => println("Null doc")
+          }
         })
 
-        println("termDocFreq  =>  " + termDocFreq)*/
+        println("termDocFreq  =>  " + termDocFreq)
+
+
+        val errors: ListBuffer[ErrorMessage] = ListBuffer()
+        val docCount = ddf.count
+        ddf.collect().foreach({ token => token match {
+            case e: ErrorToken =>
+              if (e.termFrequencies != null) {
+                val tokens: ListBuffer[String] = ListBuffer()
+                e.tokens.foreach {
+                    case term: String => {
+                      val tfIdf = e.termFrequencies.getOrElse(term, 1) * math.log(docCount/(termDocFreq.getOrElse(term, 1) + 1.0))
+                      if (tfIdf > 1) {
+                        tokens += term
+                      }
+                    }
+                 }
+
+                 errors += ErrorMessage(e.engine, e.status_code, e.state, e.exception,
+                     tokens.toList.mkString(" "))
+             }
+             case null => println("Null doc")
+          }
+        })
+
+        errors.toList.foreach(println)
     }
+
+// Main ends here
 
     def tokenize(document: Iterable[String]): List[String] = {
       var tokens = new ListBuffer[String]()
@@ -150,54 +198,26 @@ object ErrorAnalysis {
         }
 
         if(!flag && (word contains "Exception")) {
-          println("#########>> " + word)
           flag = true
           tokens += term
         }
       }
+
       tokens.toList
     }
+
 
     def transform(document: Iterable[_]): scala.collection.mutable.HashMap[String, Int] = {
       val termFrequencies = scala.collection.mutable.HashMap.empty[String, Int]
       val setTF = (s: String) => termFrequencies.getOrElse(s, 0) + 1
-
+      println(document)
       document.foreach { term =>
         val word = term.asInstanceOf[String]
+        println(word)
         termFrequencies.put(word, setTF(word))
       }
 
       termFrequencies
     }
 
-    /*def transform(document: Iterable[_]): Vector = {
-      val termFrequencies = mutable.HashMap.empty[Int, Double]
-      val setTF = if (binary) (i: Int) => 1.0 else (i: Int) => termFrequencies.getOrElse(i, 0.0) + 1.0
-      val hashFunc: Any => Int = murmur3Hash
-
-      document.foreach { term =>
-        val i = Utils.nonNegativeMod(hashFunc(term), numFeatures)
-        termFrequencies.put(i, setTF(i))
-      }
-
-      Vectors.sparse(numFeatures, termFrequencies.toSeq)
-    }
-
-    def murmur3Hash(term: Any): Int = {
-      term match {
-        case null => seed
-        case b: Boolean => hashInt(if (b) 1 else 0, seed)
-        case b: Byte => hashInt(b, seed)
-        case s: Short => hashInt(s, seed)
-        case i: Int => hashInt(i, seed)
-        case l: Long => hashLong(l, seed)
-        case f: Float => hashInt(java.lang.Float.floatToIntBits(f), seed)
-        case d: Double => hashLong(java.lang.Double.doubleToLongBits(d), seed)
-        case s: String =>
-          val utf8 = UTF8String.fromString(s)
-          hashUnsafeBytesBlock(utf8.getMemoryBlock(), seed)
-        case _ => throw new SparkException("HashingTF with murmur3 algorithm does not " +
-          s"support type ${term.getClass.getCanonicalName} of input data.")
-      }
-    }*/
 }
